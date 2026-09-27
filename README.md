@@ -19,6 +19,14 @@ ASC X12 004010 **997 功能回执**（Functional Acknowledgment）报文；对�
 接受状态（`A` 接受 / `R` 拒绝 / `U` 未知）；结构非法或计数矛盾返回 `422`，
 错误体带**段序号**与**错误码**。
 
+另提供幂等**收件库** `POST /v1/inbox`：接收单份 810 报文，先做与
+`/v1/verify` 完全相同的核验（失败原样返回 `422` 且**不写入**），核验通过后
+以 `(ISA06, GS02, BIG02)` 为收件键、按业务指纹在 SQLite 中**原子**保存原文与
+核验结果，返回固定 `receipt_id`；同键同指纹重发返回原 `receipt_id`
+（`replayed=true`），同键不同指纹返回 `409` 且不改动原记录。
+`GET /v1/inbox/{receipt_id}` 返回首次保存的原文与核验结果。数据库落在
+Compose 持久卷上，容器重启后仍能识别重发。
+
 ## 单条命令启动
 
 需要 Docker（含 Compose 插件）：
@@ -32,8 +40,14 @@ docker compose up --build -d
 - 核销接口：`POST http://localhost:8080/v1/reconcile`
 - 回执生成：`POST http://localhost:8080/v1/acknowledge`
 - 回执状态解析：`POST http://localhost:8080/v1/ack-status`
+- 收件库：`POST http://localhost:8080/v1/inbox`
+- 收件查询：`GET http://localhost:8080/v1/inbox/{receipt_id}`
 - 健康检查：`GET http://localhost:8080/health`
 - 交互文档（Swagger UI）：`http://localhost:8080/docs`
+
+收件库 SQLite 保存在命名卷 `inbox-data`（容器内 `/data/inbox.db`，由环境变量
+`INBOX_DB_PATH` 指定）；`docker compose down` 后数据仍在，重发仍被识别，
+`docker compose down -v` 才会清空收件库。
 
 停止：`docker compose down`
 
@@ -365,6 +379,105 @@ curl -s http://localhost:8080/v1/ack-status \
   }'
 ```
 
+## 请求 / 响应（POST /v1/inbox）
+
+接收**单份** 810 报文并幂等入库。先做与 `/v1/verify` 完全相同的核验，
+**核验失败原样返回 `422`（错误体与 `/v1/verify` 一致）且不写入收件库**。
+
+请求体（JSON）：
+
+```json
+{
+  "edi_text": "ISA*00*          *00*          *..."
+}
+```
+
+首次提交 `200`（原子写入原文与核验结果，`replayed=false`）：
+
+```json
+{
+  "receipt_id": "0274828f-da0d-5dcd-9c28-873d975d1c01",
+  "replayed": false,
+  "invoice_number": "INV1",
+  "lines": [
+    {"line_id": "1", "quantity": "10", "unit_price": "19.99", "line_amount": 19990}
+  ],
+  "total_amount": 19990
+}
+```
+
+同键同指纹重发 `200`（不改动记录，返回**首次保存**的核验结果）：
+
+```json
+{
+  "receipt_id": "0274828f-da0d-5dcd-9c28-873d975d1c01",
+  "replayed": true,
+  "invoice_number": "INV1",
+  "lines": [
+    {"line_id": "1", "quantity": "10", "unit_price": "19.99", "line_amount": 19990}
+  ],
+  "total_amount": 19990
+}
+```
+
+同键不同指纹 `409`（原记录不改动，`error.receipt_id` 指向已存记录）：
+
+```json
+{
+  "error": {
+    "code": "INBOX_KEY_CONFLICT",
+    "message": "同一收件键（ISA06/GS02/BIG02）已保存业务内容不同的报文，原记录未改动",
+    "receipt_id": "0274828f-da0d-5dcd-9c28-873d975d1c01"
+  }
+}
+```
+
+### 收件键与业务指纹
+
+- **收件键**：`(ISA06, GS02, BIG02)`（发送方标识 + 应用发送方代码 + 发票号），
+  同一收件键在收件库中至多一条记录（SQLite 唯一约束保证，并发提交同样适用）。
+- **业务指纹**：覆盖 `BIG` 段全部元素、按 `IT101` 排序后的各 `IT1` 段、以及
+  `TDS` 整数分。其中 `IT102` 规范为**千分位整数**（`"10"` 与 `"10.0"` 等价）、
+  `IT104` 规范为**万分位整数**（`"19.99"` 与 `"19.9900"` 等价）；`TDS` 以整数
+  分参与（`"19990"` 与 `"199.90"` 等价）。**信封控制号**（ISA13/GS06/ST02/SE/
+  GE/IEA 等）与 **IT1 行顺序不参与**指纹。
+- **receipt_id**：由收件键与业务指纹确定性导出的 UUID5，同一内容永远得到同一
+  标识，重发返回原值。
+
+### 收件查询（GET /v1/inbox/{receipt_id}）
+
+返回**首次保存**的报文原文与核验结果：
+
+```json
+{
+  "receipt_id": "0274828f-da0d-5dcd-9c28-873d975d1c01",
+  "edi_text": "ISA*00*          *00*          *...",
+  "invoice_number": "INV1",
+  "lines": [
+    {"line_id": "1", "quantity": "10", "unit_price": "19.99", "line_amount": 19990}
+  ],
+  "total_amount": 19990
+}
+```
+
+`receipt_id` 不存在时返回 `404`：
+
+```json
+{"error": {"code": "INBOX_NOT_FOUND", "message": "receipt_id 不存在: ..."}}
+```
+
+调用示例：
+
+```bash
+# 提交（再次执行同一命令即为重发，返回相同 receipt_id 且 replayed=true）
+curl -s http://localhost:8080/v1/inbox \
+  -H 'Content-Type: application/json' \
+  -d '{"edi_text": "ISA*00*          *00*          *ZZ*SENDER123456789*ZZ*RECEIVER1234567*000830*1200*U*00401*000000001*0*P*:~GS*IN*S*R*20200830*1200*42*X*004010~ST*810*0001~BIG*20200830*INV1~IT1*1*10*EA*19.99~TDS*19990~SE*5*0001~GE*1*42~IEA*1*000000001~"}'
+
+# 查询首次保存的原文与核验结果
+curl -s http://localhost:8080/v1/inbox/0274828f-da0d-5dcd-9c28-873d975d1c01
+```
+
 ## 核验规则
 
 报文结构（顺序固定，各 1 份，`IT1` 为 1～100 个）：
@@ -415,6 +528,8 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8080
 ```
 
+收件库默认写到当前目录的 `inbox.db`，可用环境变量 `INBOX_DB_PATH` 指定其他路径。
+
 运行测试：
 
 ```bash
@@ -425,15 +540,17 @@ pytest -q
 ## 仓库结构
 
 ```
-app/main.py        FastAPI 路由、请求/响应模型、422 异常处理
+app/main.py        FastAPI 路由、请求/响应模型、422/409/404 异常处理
 app/verifier.py    ISA 分隔符解析、外壳状态机、整数定点金额核验
 app/reconciler.py  采购单校验与多发票逐张核销（整数毫单位，无浮点）
 app/acknowledger.py 外壳可回执性提取与 004010 X12 997 回执生成
 app/ack_status.py  发送清单校验与 004010 X12 997 回执状态解析（A/R/U 推断）
+app/inbox.py       收件键/业务指纹提取、确定性 receipt_id、SQLite 幂等收件库
 tests/test_verify.py      /v1/verify 端到端/单元测试（39 个）
 tests/test_reconcile.py   /v1/reconcile 端到端测试（25 个）
 tests/test_acknowledge.py /v1/acknowledge 端到端测试（19 个）
 tests/test_ack_status.py  /v1/ack-status 端到端测试（48 个）
-Dockerfile         python:3.12-slim 镜像，以 nobody 运行
-docker-compose.yml 映射 8080 端口，含 /health 健康检查
+tests/test_inbox.py       /v1/inbox 端到端与存储测试（15 个）
+Dockerfile         python:3.12-slim 镜像，以 nobody 运行，/data 为收件库目录
+docker-compose.yml 映射 8080 端口，含 /health 健康检查与 inbox-data 持久卷
 ```
