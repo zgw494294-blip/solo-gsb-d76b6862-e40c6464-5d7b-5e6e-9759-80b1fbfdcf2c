@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import os
+import threading
 from typing import Literal, Optional
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .ack_status import parse_ack_status
 from .acknowledger import acknowledge
+from .inbox import (
+    InboxConflict,
+    InboxStore,
+    ReceiptNotFound,
+    business_fingerprint,
+    inbox_key,
+    receipt_id_for,
+)
 from .reconciler import (
     MAX_EDI_TEXTS,
     OrderError,
@@ -17,14 +27,15 @@ from .reconciler import (
     reconcile,
     validate_order_lines,
 )
-from .verifier import X12Error, verify_text
+from .verifier import Invoice, X12Error, verify_text
 
 app = FastAPI(
     title="X12 810 Invoice Verification API",
-    version="1.3.0",
+    version="1.4.0",
     description="核验 ASC X12 004010 单份 810 发票报文的外壳结构与发票金额，"
                 "按采购单对多份发票逐张核销，对单份 810 生成 997 功能回执，"
-                "并按发送清单解析 997 回执中各交易集的接受状态。",
+                "按发送清单解析 997 回执中各交易集的接受状态，"
+                "并提供基于 SQLite 的幂等收件库（重发识别与冲突检测）。",
 )
 
 
@@ -68,6 +79,22 @@ async def order_error_handler(_request, exc: OrderError) -> JSONResponse:
     )
 
 
+@app.exception_handler(InboxConflict)
+async def inbox_conflict_handler(_request, exc: InboxConflict) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"error": {"code": exc.code, "message": exc.message}},
+    )
+
+
+@app.exception_handler(ReceiptNotFound)
+async def receipt_not_found_handler(_request, exc: ReceiptNotFound) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={"error": {"code": exc.code, "message": exc.message}},
+    )
+
+
 @app.post(
     "/v1/verify",
     response_model=VerifyResponse,
@@ -87,6 +114,106 @@ async def verify_invoice(req: VerifyRequest) -> VerifyResponse:
             for line in invoice.lines
         ],
         total_amount=invoice.total_amount,
+    )
+
+
+# ---------- POST /v1/inbox、GET /v1/inbox/{receipt_id} ----------
+
+
+_STORE: Optional[InboxStore] = None
+_STORE_LOCK = threading.Lock()
+
+
+def get_inbox_store() -> InboxStore:
+    """收件库单例（惰性创建，路径取环境变量 INBOX_DB_PATH，默认 ./inbox.db）。"""
+    global _STORE
+    if _STORE is None:
+        with _STORE_LOCK:
+            if _STORE is None:
+                _STORE = InboxStore(os.environ.get("INBOX_DB_PATH", "inbox.db"))
+    return _STORE
+
+
+def _verify_result(invoice: Invoice) -> dict:
+    """与 /v1/verify 响应一致的核验结果（用于保存与返回）。"""
+    return {
+        "invoice_number": invoice.invoice_number,
+        "lines": [
+            {
+                "line_id": line.line_id,
+                "quantity": line.quantity,
+                "unit_price": line.unit_price,
+                "line_amount": line.line_amount,
+            }
+            for line in invoice.lines
+        ],
+        "total_amount": invoice.total_amount,
+    }
+
+
+class InboxSubmitResponse(BaseModel):
+    receipt_id: str = Field(
+        ..., description="收件回执 ID（由收件键与业务指纹确定，固定不变）")
+    replayed: bool = Field(
+        ..., description="false=首次保存；true=同收件键同业务指纹的重发")
+    invoice_number: str = Field(..., description="BIG02 发票号")
+    lines: list[LineOut]
+    total_amount: int = Field(..., description="TDS01 总额，整数分")
+
+
+class InboxRecordResponse(BaseModel):
+    receipt_id: str = Field(..., description="收件回执 ID")
+    edi_text: str = Field(..., description="首次保存的 810 报文原文")
+    invoice_number: str = Field(..., description="BIG02 发票号")
+    lines: list[LineOut]
+    total_amount: int = Field(..., description="TDS01 总额，整数分")
+
+
+@app.post(
+    "/v1/inbox",
+    response_model=InboxSubmitResponse,
+    summary="幂等接收一份 X12 810 发票报文（核验后入收件库）",
+)
+async def inbox_submit(
+    req: VerifyRequest,
+    store: InboxStore = Depends(get_inbox_store),
+) -> InboxSubmitResponse:
+    # 先沿用 /v1/verify 核验；失败抛 X12Error -> 原样 422，且不写收件库
+    invoice = verify_text(req.edi_text)
+    key = inbox_key(invoice)
+    fingerprint = business_fingerprint(invoice)
+    record = store.submit(
+        key=key,
+        fingerprint=fingerprint,
+        receipt_id=receipt_id_for(key, fingerprint),
+        edi_text=req.edi_text,
+        result=_verify_result(invoice),
+    )
+    return InboxSubmitResponse(
+        receipt_id=record.receipt_id,
+        replayed=record.replayed,
+        invoice_number=record.result["invoice_number"],
+        lines=[LineOut(**line) for line in record.result["lines"]],
+        total_amount=record.result["total_amount"],
+    )
+
+
+@app.get(
+    "/v1/inbox/{receipt_id}",
+    response_model=InboxRecordResponse,
+    summary="按 receipt_id 取回收件记录（首次保存的原文与核验结果）",
+)
+async def inbox_get(
+    receipt_id: str,
+    store: InboxStore = Depends(get_inbox_store),
+) -> InboxRecordResponse:
+    record = store.get(receipt_id)
+    return InboxRecordResponse(
+        receipt_id=record.receipt_id,
+        edi_text=record.edi_text,
+        invoice_number=record.result["invoice_number"],
+        lines=[LineOut(**line) for line in record.result["lines"]],
+        total_amount=record.result["total_amount"],
     )
 
 

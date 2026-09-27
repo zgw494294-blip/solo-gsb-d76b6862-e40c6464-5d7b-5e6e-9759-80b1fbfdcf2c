@@ -112,6 +112,11 @@ class Invoice:
     invoice_number: str   # BIG02
     lines: list[Line]
     total_amount: int     # TDS01，整数分（等于各行整数分之和）
+    # 以下为收件库（/v1/inbox）所需的信封/原文信息，不影响核验结果本身
+    isa06: str = ""                            # ISA06 发送方标识（原文，15 字符定长）
+    gs02: str = ""                             # GS02 应用发送方代码（原文）
+    big_segment: tuple[str, ...] = ()          # BIG 段全部元素（含段标识）
+    it1_segments: tuple[tuple[str, ...], ...] = ()  # 各 IT1 段全部元素（含段标识），按报文顺序
 
 
 def _err(
@@ -182,6 +187,7 @@ def verify(edi_text: str) -> Invoice:
                    f'ISA12 必须为 "00401"，实际为 {isa_fields[12]!r}', 1, "ISA")
 
     isa_ctrl = isa_fields[13]      # ISA13 交换控制号
+    isa06 = isa_fields[6]          # ISA06 发送方标识（收件键组成部分）
 
     # ---- 切段 ---------------------------------------------------------
     remainder = raw[106:].decode("ascii", errors="replace")
@@ -225,6 +231,9 @@ def verify(edi_text: str) -> Invoice:
     iea_count: Optional[int] = None
     invoice_number: Optional[str] = None
     tds_idx: Optional[int] = None
+    gs02 = ""
+    big_segment: tuple[str, ...] = ()
+    it1_segments: list[tuple[str, ...]] = []
 
     for idx, tag, fields in segments:
         if state == "GS":
@@ -237,6 +246,7 @@ def verify(edi_text: str) -> Invoice:
                            f'GS08 必须为 "004010"，实际为 {fields[8]!r}',
                            idx, tag)
             gs_ctrl = fields[6]        # GS06
+            gs02 = fields[2]           # GS02 应用发送方代码（收件键组成部分）
             gs_idx = idx
             state = "ST"
 
@@ -259,6 +269,7 @@ def verify(edi_text: str) -> Invoice:
             if fields[2] == "":       # BIG02 发票号
                 raise _err("BIG02_EMPTY", "BIG02 发票号不能为空", idx, tag)
             invoice_number = fields[2]
+            big_segment = tuple(fields)
             state = "IT1"
 
         elif state == "IT1":
@@ -288,6 +299,7 @@ def verify(edi_text: str) -> Invoice:
                 line_cents = _line_to_cents(qty, unit)
                 total_cents += line_cents
                 lines.append(Line(line_id, qty_raw, unit_raw, line_cents))
+                it1_segments.append(tuple(fields))
 
             elif tag == "TDS":
                 _min_len(tag, fields, 2, idx)
@@ -402,7 +414,9 @@ def verify(edi_text: str) -> Invoice:
 
     assert invoice_number is not None and tds_idx is not None
     return Invoice(invoice_number=invoice_number,
-                   lines=lines, total_amount=total_cents)
+                   lines=lines, total_amount=total_cents,
+                   isa06=isa06, gs02=gs02, big_segment=big_segment,
+                   it1_segments=tuple(it1_segments))
 
 
 def verify_text(edi_text: str) -> Invoice:
